@@ -1,15 +1,16 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
-import librosa
-import numpy as np
 import os
 import tempfile
 from datetime import datetime
-from typing import List
+from typing import List, Dict, Any
+from bson import ObjectId
 import uvicorn
 from pydantic import BaseModel
+from process_data import extract_features, calculate_similarity
 
 app = FastAPI(title="Audio Similarity API")
 
@@ -31,12 +32,26 @@ client = AsyncIOMotorClient(MONGODB_URL)
 db = client.multimedia_db
 audio_collection = db.audio_files
 
+class FeatureDetails(BaseModel):
+    mfcc_mean: List[float]
+    mfcc_var: List[float]
+    chroma_mean: List[float]
+    zero_crossing_rate: Dict[str, float]
+    spectral_centroid: Dict[str, float]
+    spectral_rolloff: Dict[str, float]
+    spectral_flux: Dict[str, float]
+    rms_energy: Dict[str, float]
+    spectral_contrast: List[float]
+
 class AudioMetadata(BaseModel):
+    id: str
     filename: str
     filepath: str
     duration: float
     sample_rate: int
     similarity_score: float = None
+    spectrogram: str = None
+    feature_details: FeatureDetails = None
 
 @app.on_event("startup")
 async def startup_db_client():
@@ -53,7 +68,7 @@ async def startup_db_client():
     for filename in os.listdir(training_folder):
         if filename.endswith(".mp3"):
             file_path = os.path.join(training_folder, filename)
-            features, sample_rate, duration = await extract_features(file_path)
+            features, feature_details, sample_rate, duration, spectrogram = await extract_features(file_path)
 
             print(f"Loaded {filename}: {duration} seconds, {sample_rate} Hz")    
 
@@ -62,8 +77,35 @@ async def startup_db_client():
                 "filename": filename,
                 "filepath": file_path,
                 "features": features,
+                "feature_details": {
+                    "mfcc_mean": feature_details["mfcc_mean"],
+                    "mfcc_var": feature_details["mfcc_var"],
+                    "chroma_mean": feature_details["chroma_mean"],
+                    "zero_crossing_rate": {
+                        "mean": feature_details["zero_crossing_rate_mean"],
+                        "var": feature_details["zero_crossing_rate_var"]
+                    },
+                    "spectral_centroid": {
+                        "mean": feature_details["spectral_centroid_mean"],
+                        "var": feature_details["spectral_centroid_var"]
+                    },
+                    "spectral_rolloff": {
+                        "mean": feature_details["rolloff_mean"],
+                        "var": feature_details["rolloff_var"]
+                    },
+                    "spectral_flux": {
+                        "mean": feature_details["spectral_flux_mean"],
+                        "var": feature_details["spectral_flux_var"]
+                    },
+                    "rms_energy": {
+                        "mean": feature_details["rms_mean"],
+                        "var": feature_details["rms_var"]
+                    },
+                    "spectral_contrast": feature_details["spectral_contrast_mean"].tolist() if hasattr(feature_details["spectral_contrast_mean"], "tolist") else feature_details["spectral_contrast_mean"]
+                },
                 "duration": duration,
                 "sample_rate": sample_rate,
+                "spectrogram": spectrogram,
                 "timestamp": datetime.utcnow()
             }
             result = await audio_collection.insert_one(training_file)
@@ -83,51 +125,77 @@ async def shutdown_db_client():
     """Close MongoDB client"""
     app.mongodb_client.close()
 
-async def extract_features(file_path):
-    """Extract robust audio features from the file"""
-    y, sr = librosa.load(file_path, sr=22050)
+@app.post("/upload")
+async def upload_audio_file(file: UploadFile = File(...)):
+    """Upload an audio file and return its metadata without comparison"""
+    if not file.filename.lower().endswith(".mp3"):
+        raise HTTPException(status_code=400, detail="File must be an MP3")
     
-    # Extract MFCCs
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-    mfcc_mean = np.mean(mfcc.T, axis=0)
-    
-    # Extract Spectral Centroid
-    spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
-    spectral_centroid_mean = np.mean(spectral_centroid)
-    
-    # Extract Chroma Features
-    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-    chroma_mean = np.mean(chroma.T, axis=0)
-    
-    # Extract Spectral Contrast
-    spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
-    spectral_contrast_mean = np.mean(spectral_contrast.T, axis=0)
-    
-    # Extract Zero-Crossing Rate
-    zero_crossing_rate = librosa.feature.zero_crossing_rate(y)
-    zero_crossing_rate_mean = np.mean(zero_crossing_rate)
-    
-    # Combine all features into a single array
-    features = np.concatenate([
-        mfcc_mean,
-        [spectral_centroid_mean],
-        chroma_mean,
-        spectral_contrast_mean,
-        [zero_crossing_rate_mean]
-    ])
-    
-    return features.tolist(), sr, len(y) / sr
+    # Save uploaded file temporarily
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    try:
+        # Write the uploaded file content to the temporary file
+        content = await file.read()
+        with open(temp_file.name, "wb") as f:
+            f.write(content)
+            
+        # Explicitly close the file to release the lock
+        temp_file.close()  
+        
+        # Extract features from the uploaded file
+        features, feature_details, sample_rate, duration, spectrogram = await extract_features(temp_file.name)
+        
+        # Store the uploaded file with its features
+        uploaded_file = {
+            "filename": file.filename,
+            "features": features,
+            "feature_details": {
+                "mfcc_mean": feature_details["mfcc_mean"],
+                "mfcc_var": feature_details["mfcc_var"],
+                "chroma_mean": feature_details["chroma_mean"],
+                "zero_crossing_rate": {
+                    "mean": feature_details["zero_crossing_rate_mean"],
+                    "var": feature_details["zero_crossing_rate_var"]
+                },
+                "spectral_centroid": {
+                    "mean": feature_details["spectral_centroid_mean"],
+                    "var": feature_details["spectral_centroid_var"]
+                },
+                "spectral_rolloff": {
+                    "mean": feature_details["rolloff_mean"],
+                    "var": feature_details["rolloff_var"]
+                },
+                "spectral_flux": {
+                    "mean": feature_details["spectral_flux_mean"],
+                    "var": feature_details["spectral_flux_var"]
+                },
+                "rms_energy": {
+                    "mean": feature_details["rms_mean"],
+                    "var": feature_details["rms_var"]
+                },
+                "spectral_contrast": feature_details["spectral_contrast_mean"].tolist() if hasattr(feature_details["spectral_contrast_mean"], "tolist") else feature_details["spectral_contrast_mean"]
+            },
+            "duration": duration,
+            "sample_rate": sample_rate,
+            "spectrogram": spectrogram,
+            "timestamp": datetime.utcnow(),
+            "is_query": True
+        }
 
-async def calculate_similarity(features1, features2):
-    """Calculate cosine similarity between normalized feature vectors"""
-    # Normalize the feature vectors
-    norm_features1 = features1 / np.linalg.norm(features1)
-    norm_features2 = features2 / np.linalg.norm(features2)
+        # Return the metadata with ID
+        return {
+            "duration": duration,
+            "sample_rate": sample_rate,
+            "spectrogram": spectrogram,
+            "feature_details": uploaded_file["feature_details"]
+        }
     
-    # Calculate cosine similarity
-    return 1 - np.dot(norm_features1, norm_features2)
+    finally:
+        # Ensure the temporary file is deleted
+        if os.path.exists(temp_file.name):
+            os.unlink(temp_file.name)
 
-@app.post("/upload/", response_model=List[AudioMetadata])
+@app.post("/upload/q", response_model=List[AudioMetadata])
 async def upload_audio(file: UploadFile = File(...)):
     """Upload a test MP3 file and find the 3 nearest files from training data"""
     if not file.filename.lower().endswith(".mp3"):
@@ -145,7 +213,45 @@ async def upload_audio(file: UploadFile = File(...)):
         temp_file.close()  
         
         # Extract features from the uploaded test file
-        features, sample_rate, duration = await extract_features(temp_file.name)
+        features, feature_details, sample_rate, duration, spectrogram = await extract_features(temp_file.name)
+        
+        # Store the uploaded file with its features
+        uploaded_file = {
+            "filename": file.filename,
+            "filepath": "uploads/" + file.filename,
+            "features": features,
+            "feature_details": {
+                "mfcc_mean": feature_details["mfcc_mean"],
+                "mfcc_var": feature_details["mfcc_var"],
+                "chroma_mean": feature_details["chroma_mean"],
+                "zero_crossing_rate": {
+                    "mean": feature_details["zero_crossing_rate_mean"],
+                    "var": feature_details["zero_crossing_rate_var"]
+                },
+                "spectral_centroid": {
+                    "mean": feature_details["spectral_centroid_mean"],
+                    "var": feature_details["spectral_centroid_var"]
+                },
+                "spectral_rolloff": {
+                    "mean": feature_details["rolloff_mean"],
+                    "var": feature_details["rolloff_var"]
+                },
+                "spectral_flux": {
+                    "mean": feature_details["spectral_flux_mean"],
+                    "var": feature_details["spectral_flux_var"]
+                },
+                "rms_energy": {
+                    "mean": feature_details["rms_mean"],
+                    "var": feature_details["rms_var"]
+                },
+                "spectral_contrast": feature_details["spectral_contrast_mean"].tolist() if hasattr(feature_details["spectral_contrast_mean"], "tolist") else feature_details["spectral_contrast_mean"]
+            },
+            "duration": duration,
+            "sample_rate": sample_rate,
+            "spectrogram": spectrogram,
+            "timestamp": datetime.utcnow(),
+            "is_query": True
+        }
         
         # Compare with training data
         similarities = []
@@ -157,7 +263,9 @@ async def upload_audio(file: UploadFile = File(...)):
                 "filepath": train_file["filepath"],
                 "duration": train_file["duration"],
                 "sample_rate": train_file["sample_rate"],
-                "similarity_score": similarity
+                "similarity_score": similarity,
+                "spectrogram": train_file["spectrogram"],
+                "feature_details": train_file.get("feature_details")
             })
         
         # Sort by similarity (lower score = more similar)
