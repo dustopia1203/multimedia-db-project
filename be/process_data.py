@@ -118,14 +118,68 @@ def generate_spectrogram(y, sr):
     return img_str
 
 async def calculate_similarity(features1, features2):
-    """Calculate cosine similarity between normalized feature vectors"""
+    """Calculate cosine similarity between normalized feature vectors,
+    with proper scaling to prevent any feature group from dominating"""
     # Convert to numpy arrays if they aren't already
     features1 = np.array(features1)
     features2 = np.array(features2)
     
-    # Normalize the feature vectors
-    norm_features1 = features1 / (np.linalg.norm(features1) + 1e-10)  # Avoid division by zero
-    norm_features2 = features2 / (np.linalg.norm(features2) + 1e-10)
+    # Define feature group indices for targeted normalization
+    mfcc_mean_indices = range(0, 20)  # First 20 features are MFCC means
+    mfcc_var_indices = range(20, 40)  # Next 20 are MFCC variances
+    chroma_indices = range(40, 52)    # Next 12 are chroma features
+    scalar_indices = range(52, 67)    # Remaining are scalar features
+    
+    # Initialize normalized feature arrays
+    norm_features1 = np.zeros_like(features1, dtype=float)
+    norm_features2 = np.zeros_like(features2, dtype=float)
+    
+    # Apply group-wise normalization with weights
+    feature_groups = [
+        {"indices": mfcc_mean_indices, "weight": 1.0},
+        {"indices": mfcc_var_indices, "weight": 0.8},  # Slightly less weight to variance
+        {"indices": chroma_indices, "weight": 1.2},    # Slightly more weight to pitch info
+        {"indices": scalar_indices, "weight": 0.9}     # Slightly less weight to scalar features
+    ]
+    
+    for group in feature_groups:
+        indices = group["indices"]
+        weight = group["weight"]
+        
+        # Skip empty groups
+        if len(indices) == 0:
+            continue
+        
+        # Get the feature group for both vectors
+        group1 = features1[indices]
+        group2 = features2[indices]
+        
+        # Calculate range for normalization
+        min_val = min(np.min(group1), np.min(group2))
+        max_val = max(np.max(group1), np.max(group2))
+        
+        # Avoid division by zero
+        range_val = max_val - min_val
+        if range_val < 1e-10:
+            range_val = 1.0
+        
+        # Normalize to [0,1] range
+        norm_features1[indices] = weight * (features1[indices] - min_val) / range_val
+        norm_features2[indices] = weight * (features2[indices] - min_val) / range_val
+    
+    # Calculate L2 norm
+    norm1 = np.linalg.norm(norm_features1)
+    norm2 = np.linalg.norm(norm_features2)
+    
+    # Avoid division by zero
+    if norm1 < 1e-10:
+        norm1 = 1.0
+    if norm2 < 1e-10:
+        norm2 = 1.0
+    
+    # Normalize vectors
+    norm_features1 = norm_features1 / norm1
+    norm_features2 = norm_features2 / norm2
     
     # Calculate cosine similarity
     similarity = np.dot(norm_features1, norm_features2)
